@@ -1,0 +1,141 @@
+name: Verify and prepare K8GB contribution
+on:
+  push:
+    branches: [koyo/stage-k8gb-20260910]
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.repository == 'ugin-man/console'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      BASE_SHA: 66bad0cd9d6b11215a2b35f4672441ec19671320
+      HEAD_BRANCH: koyo/k8gb-compatibility-20260910
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 66bad0cd9d6b11215a2b35f4672441ec19671320
+          path: work
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /utils/compatibility/
+            /static/compatibilities/
+            /static/compatibilities.yaml
+            /KUBE_VERSION
+            /README.md
+            /AGENTS.md
+            /.github/PULL_REQUEST_TEMPLATE.md
+      - name: Verify transfer and apply original prepared patch
+        working-directory: work
+        run: |
+          set -euo pipefail
+          mkdir -p ../evidence
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          python3 - <<'PY'
+          from pathlib import Path
+          import gzip, hashlib, subprocess
+          raw = b''.join((Path('../.koyo') / f'part{i}').read_bytes() for i in range(1, 5))
+          assert hashlib.sha256(raw).hexdigest() == '91109b38987fb13b27fad98d13ef087bc9c0eabe5b9f7b4ec161a077b9c712a6'
+          patch = gzip.decompress(raw)
+          assert hashlib.sha256(patch).hexdigest() == '1923c948cbac82e6d64123637680f428cd8e3736b5f5685d5013d4d0e1876f37'
+          Path('../evidence/prepared.patch').write_bytes(patch)
+          paths = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', 'HEAD'], text=True).splitlines()
+          assert not [p for p in paths if 'k8gb' in p.lower()], 'K8GB already present on base'
+          guides = [p for p in paths if p.endswith(('AGENTS.md', 'CONTRIBUTING.md')) and (p.startswith(('utils/', 'static/')) or '/' not in p)]
+          assert guides == ['AGENTS.md'], f'Additional instructions need review: {guides}'
+          Path('../evidence/base-aggregate.yaml').write_bytes(Path('static/compatibilities.yaml').read_bytes())
+          Path('../evidence/base-manifest.yaml').write_bytes(Path('static/compatibilities/manifest.yaml').read_bytes())
+          PY
+          git apply --check ../evidence/prepared.patch
+          git apply ../evidence/prepared.patch
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p = Path('utils/compatibility/scrapers/k8gb.py')
+          assert hashlib.sha256(p.read_bytes()).hexdigest() == 'da193aace914e00bfb57c8d20244c91d07e61230916d69b6862b413bac09a8df'
+          PY
+      - name: Install verification dependencies
+        working-directory: work
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/k8gb-venv"
+          echo "$RUNNER_TEMP/k8gb-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/k8gb-venv/bin/python" -m pip install -r utils/compatibility/requirements.txt pytest pytest-subtests jsonschema > ../evidence/install.log 2>&1
+          command -v helm
+          helm version --short | tee ../evidence/helm.txt
+      - name: Run complete compatibility tests
+        working-directory: work
+        run: |
+          set -euo pipefail
+          python -m pytest utils/compatibility/tests -q --junitxml=../evidence/tests.xml 2>&1 | tee ../evidence/tests.log
+      - name: Run actual scraper twice and check catalog preservation
+        working-directory: work
+        run: |
+          set -euo pipefail
+          python - <<'PY' 2>&1 | tee ../evidence/live.log
+          from pathlib import Path
+          import os, subprocess, sys, json, hashlib, yaml, jsonschema
+          root = Path.cwd()
+          evidence = root.parent / 'evidence'
+          original = (evidence / 'base-aggregate.yaml').read_bytes()
+          before = yaml.safe_load(original)
+          manifest_before = yaml.safe_load((evidence / 'base-manifest.yaml').read_bytes())
+          os.chdir(root / 'utils/compatibility')
+          sys.path.insert(0, str(Path.cwd()))
+          from scrapers import k8gb
+          first = k8gb.scrape()
+          first_bytes = (root / 'static/compatibilities/k8gb.yaml').read_bytes()
+          second = k8gb.scrape()
+          second_bytes = (root / 'static/compatibilities/k8gb.yaml').read_bytes()
+          assert first == second and first_bytes == second_bytes
+          assert original.endswith(b'\n')
+          addon = dict(first, name='k8gb')
+          assert not any(x.get('name') == 'k8gb' for x in before['addons'])
+          suffix = yaml.dump([addon], sort_keys=False, default_flow_style=False).encode()
+          combined_bytes = original + suffix
+          combined = yaml.safe_load(combined_bytes)
+          assert combined['addons'][:-1] == before['addons']
+          assert combined['addons'][-1] == addon
+          (root / 'static/compatibilities.yaml').write_bytes(combined_bytes)
+          manifest = yaml.safe_load((root / 'static/compatibilities/manifest.yaml').read_bytes())
+          assert manifest['names'] == manifest_before['names'] + ['k8gb']
+          schema = json.loads((root / 'static/compatibilities/schema.json').read_text())
+          tables = [root / 'static/compatibilities.yaml', *sorted((root / 'static/compatibilities').glob('*.yaml'))]
+          for table in tables:
+              jsonschema.validate(yaml.safe_load(table.read_bytes()), schema)
+          report = {'base': os.environ['BASE_SHA'], 'catalog_rows': len(first['versions']), 'versions': [x['version'] for x in first['versions']], 'two_live_runs_identical': True, 'previous_aggregate_entries_preserved': len(before['addons']), 'schema_files_passed': len(tables), 'table_sha256': hashlib.sha256(first_bytes).hexdigest(), 'source_sha256': hashlib.sha256((root / 'utils/compatibility/scrapers/k8gb.py').read_bytes()).hexdigest(), 'python': sys.version, 'helm': subprocess.check_output(['helm', 'version', '--short'], text=True).strip(), 'cluster_deployment': False, 'whole_application_build': False}
+          (evidence / 'result.json').write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+          PY
+      - name: Commit exactly seven contribution files and publish only the new branch
+        working-directory: work
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git switch -c "$HEAD_BRANCH"
+          git add -- static/compatibilities.yaml static/compatibilities/manifest.yaml static/compatibilities/k8gb.yaml utils/compatibility/scrapers/k8gb.py utils/compatibility/tests/K8GB.md utils/compatibility/tests/fixtures/k8gb/index.yaml utils/compatibility/tests/test_k8gb.py
+          test "$(git diff --cached --name-only | wc -l)" -eq 7
+          git diff --cached --check
+          git diff --cached --binary > ../evidence/submitted.patch
+          git diff --cached --stat | tee ../evidence/diff-stat.txt
+          git -c user.name=ugin-man -c user.email=157204743+ugin-man@users.noreply.github.com commit -m 'feat: add K8GB Helm compatibility scraper' -m 'Prepared and automatically verified with ChatGPT assistance.'
+          git rev-parse HEAD | tee ../evidence/head-sha.txt
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:refs/heads/$HEAD_BRANCH"
+      - name: Preserve validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: k8gb-submission-verification
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
