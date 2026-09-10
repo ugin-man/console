@@ -154,10 +154,10 @@ class ScrapeTests(unittest.TestCase):
             for v,body in ((a,body_a),(b,body_b))}}
         self.results = subprocess.CompletedProcess([], 0, stdout="spec:\n  containers:\n    - image: example/k8gb:v1.0.0\n", stderr="")
 
-    def execute(self, results=None):
+    def execute(self, results=None, fetch=None):
         with patch.object(k8gb,"TARGET_FILE", str(self.file)), \
                 patch.object(utils,"current_kube_version", return_value="1.36"), \
-                patch.object(k8gb,"fetch_bytes", side_effect=self.sources.__getitem__), \
+                patch.object(k8gb,"fetch_bytes", side_effect=fetch if fetch is not None else self.sources.__getitem__), \
                 patch.object(k8gb.subprocess,"run", side_effect=results) if results is not None else patch.object(k8gb.subprocess,"run", return_value=self.results):
             return k8gb.scrape()
 
@@ -195,6 +195,136 @@ class ScrapeTests(unittest.TestCase):
         self.original["versions"] = [{"version":"1.0.0","summary":{"features":["Existing note"]}}]
         self.file.write_text(yaml.safe_dump(self.original))
         self.assertEqual(self.execute()["versions"][0]["summary"], {"features":["Existing note"]})
+
+    def test_removed_chart_does_not_block_new_versions(self):
+        self.execute()
+        new, body = entry("v2.0.0")
+        self.sources[f"{k8gb.HELM_REPOSITORY}/{new['urls'][0]}"] = body
+        self.sources[k8gb.INDEX_URL] = index([new, self.entries[0]])
+        del self.sources[f"{k8gb.HELM_REPOSITORY}/charts/k8gb-v0.14.0.tgz"]
+
+        result = self.execute()
+
+        self.assertEqual([r["version"] for r in result["versions"]], ["2.0.0", "1.0.0"])
+        self.assertEqual(yaml.safe_load(self.file.read_text()), result)
+        self.assertEqual(result["icon"], self.original["icon"])
+        once = self.file.read_bytes()
+        stamp = self.file.stat().st_mtime_ns
+        self.assertEqual(self.execute(), result)
+        self.assertEqual(self.file.read_bytes(), once)
+        self.assertEqual(self.file.stat().st_mtime_ns, stamp)
+
+    def test_deprecated_chart_does_not_block_new_versions(self):
+        self.execute()
+        new, body = entry("v2.0.0")
+        self.sources[f"{k8gb.HELM_REPOSITORY}/{new['urls'][0]}"] = body
+        deprecated = dict(self.entries[1], deprecated=True)
+        self.sources[k8gb.INDEX_URL] = index([deprecated, new, self.entries[0]])
+        del self.sources[f"{k8gb.HELM_REPOSITORY}/charts/k8gb-v0.14.0.tgz"]
+
+        result = self.execute()
+
+        self.assertEqual([r["version"] for r in result["versions"]], ["2.0.0", "1.0.0"])
+        self.assertEqual(yaml.safe_load(self.file.read_text()), result)
+
+    def test_removed_boundary_is_pruned_before_patch_reduction(self):
+        newest, newest_body = entry("v2.0.0")
+        self.sources[f"{k8gb.HELM_REPOSITORY}/{newest['urls'][0]}"] = newest_body
+        self.sources[k8gb.INDEX_URL] = index([newest, self.entries[0]])
+        self.execute()
+        replacement, body = entry("v1.0.1")
+        self.sources[f"{k8gb.HELM_REPOSITORY}/{replacement['urls'][0]}"] = body
+        self.sources[k8gb.INDEX_URL] = index([newest, replacement])
+        del self.sources[f"{k8gb.HELM_REPOSITORY}/charts/k8gb-v1.0.0.tgz"]
+
+        result = self.execute()
+
+        # With the absent 1.0.0 row still present, the reducer keeps that old
+        # boundary and drops 1.0.1 because their Kubernetes ranges are equal.
+        self.assertEqual([r["version"] for r in result["versions"]], ["2.0.0", "1.0.1"])
+        self.assertEqual(result["versions"][1]["chart_version"], "v1.0.1")
+        self.assertEqual(yaml.safe_load(self.file.read_text()), result)
+
+    def test_replacement_chart_preserves_application_summary(self):
+        self.execute()
+        existing = yaml.safe_load(self.file.read_text())
+        summary = {"features": ["Keep this application release note"]}
+        existing["versions"][0]["summary"] = summary
+        self.file.write_text(yaml.safe_dump(existing))
+        replacement = dict(self.entries[0], version="v1.0.1",
+                           urls=["charts/k8gb-v1.0.1.tgz"])
+        body = archive(replacement)
+        replacement["digest"] = hashlib.sha256(body).hexdigest()
+        self.sources[f"{k8gb.HELM_REPOSITORY}/{replacement['urls'][0]}"] = body
+        self.sources[k8gb.INDEX_URL] = index([replacement, self.entries[1]])
+        del self.sources[f"{k8gb.HELM_REPOSITORY}/charts/k8gb-v1.0.0.tgz"]
+
+        result = self.execute()
+
+        self.assertEqual(result["versions"][0]["version"], "1.0.0")
+        self.assertEqual(result["versions"][0]["chart_version"], "v1.0.1")
+        self.assertEqual(result["versions"][0]["summary"], summary)
+        self.assertEqual(yaml.safe_load(self.file.read_text()), result)
+
+    def test_index_or_advertised_archive_http_failure_preserves_history(self):
+        self.execute()
+        before = self.file.read_bytes()
+        self.sources[k8gb.INDEX_URL] = index([self.entries[0]])
+        advertised_url = f"{k8gb.HELM_REPOSITORY}/charts/k8gb-v1.0.0.tgz"
+        for failed_url in (k8gb.INDEX_URL, advertised_url):
+            for status in (404, 503):
+                with self.subTest(url=failed_url, status=status):
+                    response = k8gb.requests.Response()
+                    response.status_code = status
+
+                    def fetch(url):
+                        if url == failed_url:
+                            raise k8gb.requests.HTTPError("Upstream unavailable", response=response)
+                        return self.sources[url]
+
+                    with self.assertRaises(k8gb.requests.HTTPError) as error:
+                        self.execute(fetch=fetch)
+                    self.assertEqual(error.exception.response.status_code, status)
+                    self.assertEqual(self.file.read_bytes(), before)
+
+    def test_empty_or_wholly_ineligible_index_preserves_history(self):
+        self.execute()
+        before = self.file.read_bytes()
+        cases = [[], [dict(e, deprecated=True) for e in self.entries],
+                 [dict(e, kubeVersion="") for e in self.entries],
+                 [entry("v2.0.0-rc1")[0]]]
+        for entries in cases:
+            with self.subTest(entries=entries):
+                self.sources[k8gb.INDEX_URL] = index(entries)
+                with self.assertRaises(ValueError):
+                    self.execute()
+                self.assertEqual(self.file.read_bytes(), before)
+
+    def test_removal_and_remaining_archive_failure_do_not_write(self):
+        self.execute()
+        before = self.file.read_bytes()
+        self.sources[k8gb.INDEX_URL] = index([self.entries[0]])
+        self.sources[f"{k8gb.HELM_REPOSITORY}/charts/k8gb-v1.0.0.tgz"] = b"corrupt"
+        with self.assertRaisesRegex(ValueError, "digest"):
+            self.execute()
+        self.assertEqual(self.file.read_bytes(), before)
+
+    def test_removal_and_remaining_render_failure_do_not_write(self):
+        self.execute()
+        before = self.file.read_bytes()
+        self.sources[k8gb.INDEX_URL] = index([self.entries[0]])
+        error = subprocess.CalledProcessError(1, ["helm"], stderr="bad chart")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.execute([error])
+        self.assertEqual(self.file.read_bytes(), before)
+
+    def test_removal_and_malformed_current_entry_do_not_write(self):
+        self.execute()
+        before = self.file.read_bytes()
+        self.sources[k8gb.INDEX_URL] = index([dict(self.entries[0], kubeVersion=">=1.21.1")])
+        with self.assertRaisesRegex(ValueError, "Unsupported Kubernetes requirement"):
+            self.execute()
+        self.assertEqual(self.file.read_bytes(), before)
 
     def test_missing_target_never_creates_a_metadata_less_table(self):
         self.file.unlink()
