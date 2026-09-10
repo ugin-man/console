@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: bf9baa3d120228e234bc9e8ed8a1f55c97bcb75b
+          ref: 9b17d8cb935833b7eba86578b221af6dc8aac298
           fetch-depth: 2
           persist-credentials: false
           sparse-checkout: |
@@ -34,11 +34,11 @@ jobs:
           root = pathlib.Path.cwd()
           evidence = root / 'evidence'
           old = '2bb08ae105339390a56d673a2630252c21c2769d'
-          fixed = 'bf9baa3d120228e234bc9e8ed8a1f55c97bcb75b'
+          fixed = '9b17d8cb935833b7eba86578b221af6dc8aac298'
           assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip() == fixed
           hashes = {
             'utils/compatibility/scrapers/k8gb.py':'d6d181fe81b7496f651ef8b9bcfaf41d583918b45024ad30d7224862e554b7ea',
-            'utils/compatibility/tests/test_k8gb.py':'b644beb601ff16317f26113d5e53ac5850182dc6e621e33a671b2c77886edf76',
+            'utils/compatibility/tests/test_k8gb.py':'7b63157c70fb147f21bdb5c80a18c8d6120db6590ccf96e113ec30283c5caee4',
             'utils/compatibility/tests/K8GB.md':'18082d46445a23e2c44be031d3c05712b234c46a2ac28e773c947d9b68e03616',
           }
           for path, digest in hashes.items():
@@ -91,7 +91,7 @@ jobs:
           assert before == once, 'Published index changed; inspect before updating catalog data'
           assert aggregate.read_bytes() == aggregate_before
           assert manifest.read_bytes() == manifest_before
-          result={'fixed':'bf9baa3d120228e234bc9e8ed8a1f55c97bcb75b','two_live_runs_identical':True,'catalog_unchanged':True,'catalog_rows':len(first['versions']),'table_sha256':hashlib.sha256(twice).hexdigest(),'http_and_helm_mocked':False,'aggregate_and_manifest_unchanged':True}
+          result={'fixed':'9b17d8cb935833b7eba86578b221af6dc8aac298','two_live_runs_identical':True,'catalog_unchanged':True,'catalog_rows':len(first['versions']),'table_sha256':hashlib.sha256(twice).hexdigest(),'http_and_helm_mocked':False,'aggregate_and_manifest_unchanged':True}
           (evidence/'live.json').write_text(json.dumps(result,indent=2))
           print(json.dumps(result,indent=2))
           PY
