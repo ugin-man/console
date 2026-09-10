@@ -1,0 +1,105 @@
+name: Verify K8GB review fix
+on:
+  push:
+    branches: [koyo/verify-k8gb-review-20260910]
+    paths: [.github/workflows/koyo-k8gb-review-verification.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: bf9baa3d120228e234bc9e8ed8a1f55c97bcb75b
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout: |
+            utils/compatibility
+            static/compatibilities
+      - name: Install test-only dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 -m venv "$RUNNER_TEMP/k8gb-review-venv"
+          echo "$RUNNER_TEMP/k8gb-review-venv/bin" >> "$GITHUB_PATH"
+          grep -Ev '^(exa-py|openai)$' utils/compatibility/requirements.txt > evidence/requirements.txt
+          "$RUNNER_TEMP/k8gb-review-venv/bin/python" -m pip install -r evidence/requirements.txt pytest pytest-subtests jsonschema 2>&1 | tee evidence/install.log
+          "$RUNNER_TEMP/k8gb-review-venv/bin/python" -m pip freeze > evidence/environment.txt
+      - name: Run original-source negative control and complete corrected suite
+        run: |
+          python - <<'PY'
+          import hashlib, json, pathlib, subprocess, sys, xml.etree.ElementTree as ET
+          root = pathlib.Path.cwd()
+          evidence = root / 'evidence'
+          old = '2bb08ae105339390a56d673a2630252c21c2769d'
+          fixed = 'bf9baa3d120228e234bc9e8ed8a1f55c97bcb75b'
+          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip() == fixed
+          hashes = {
+            'utils/compatibility/scrapers/k8gb.py':'d6d181fe81b7496f651ef8b9bcfaf41d583918b45024ad30d7224862e554b7ea',
+            'utils/compatibility/tests/test_k8gb.py':'b644beb601ff16317f26113d5e53ac5850182dc6e621e33a671b2c77886edf76',
+            'utils/compatibility/tests/K8GB.md':'18082d46445a23e2c44be031d3c05712b234c46a2ac28e773c947d9b68e03616',
+          }
+          for path, digest in hashes.items():
+              assert hashlib.sha256((root/path).read_bytes()).hexdigest() == digest, path
+          changed = subprocess.check_output(['git','diff','--name-only',old,fixed],text=True).splitlines()
+          assert set(changed) == set(hashes), changed
+          source = root/'utils/compatibility/scrapers/k8gb.py'
+          corrected = source.read_bytes()
+          source.write_bytes(subprocess.check_output(['git','show',old+':utils/compatibility/scrapers/k8gb.py']))
+          try:
+              before = subprocess.run([sys.executable,'-m','pytest','utils/compatibility/tests/test_k8gb.py','-q','--junitxml=evidence/before.xml'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+              (evidence/'before.log').write_text(before.stdout)
+              print(before.stdout)
+              failures = {case.attrib['name'] for case in ET.parse(evidence/'before.xml').iter('testcase') if case.find('failure') is not None or case.find('error') is not None}
+              expected = {'test_removed_chart_does_not_block_new_versions','test_deprecated_chart_does_not_block_new_versions','test_removed_boundary_is_pruned_before_patch_reduction'}
+              assert before.returncode == 1 and failures == expected, (before.returncode,failures)
+          finally:
+              source.write_bytes(corrected)
+          after = subprocess.run([sys.executable,'-m','pytest','utils/compatibility/tests','-q','--junitxml=evidence/after.xml'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+          (evidence/'after.log').write_text(after.stdout)
+          print(after.stdout)
+          assert after.returncode == 0, after.returncode
+          subprocess.run(['git','diff','--check',old,fixed],check=True)
+          subprocess.run(['git','diff','--exit-code'],check=True)
+          (evidence/'fix.patch').write_bytes(subprocess.check_output(['git','diff',old,fixed]))
+          (evidence/'result.json').write_text(json.dumps({'original':old,'fixed':fixed,'source_hashes':hashes,'expected_original_failures':sorted(failures),'full_compatibility_suite_passed':True,'changed_paths':changed,'python':sys.version,'cluster_deployment':False,'whole_console_build':False},indent=2))
+          PY
+      - name: Exercise corrected scraper with real HTTP and Helm
+        run: |
+          set -euo pipefail
+          helm version --short | tee evidence/helm.txt
+          python - <<'PY'
+          import hashlib,json,os,pathlib,subprocess,sys
+          root = pathlib.Path.cwd()
+          sys.path.insert(0,str(root/'utils/compatibility'))
+          from scrapers import k8gb
+          evidence=root/'evidence'
+          target=root/'static/compatibilities/k8gb.yaml'
+          aggregate=root/'static/compatibilities.yaml'
+          manifest=root/'static/compatibilities/manifest.yaml'
+          before=target.read_bytes()
+          aggregate_before=aggregate.read_bytes()
+          manifest_before=manifest.read_bytes()
+          os.chdir(root/'utils/compatibility')
+          first=k8gb.scrape()
+          once=target.read_bytes()
+          second=k8gb.scrape()
+          twice=target.read_bytes()
+          assert first == second and once == twice
+          assert before == once, 'Published index changed; inspect before updating catalog data'
+          assert aggregate.read_bytes() == aggregate_before
+          assert manifest.read_bytes() == manifest_before
+          result={'fixed':'bf9baa3d120228e234bc9e8ed8a1f55c97bcb75b','two_live_runs_identical':True,'catalog_unchanged':True,'catalog_rows':len(first['versions']),'table_sha256':hashlib.sha256(twice).hexdigest(),'http_and_helm_mocked':False,'aggregate_and_manifest_unchanged':True}
+          (evidence/'live.json').write_text(json.dumps(result,indent=2))
+          print(json.dumps(result,indent=2))
+          PY
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: k8gb-review-fix-verification
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
