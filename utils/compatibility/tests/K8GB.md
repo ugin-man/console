@@ -47,6 +47,19 @@ successfully and yield container images before the first table write; an error
 cannot write the first half of a batch. There is no cluster deployment, Helm
 installation, or paid summarization/model call.
 
+## Upstream index changes
+
+The catalog is refreshed from currently eligible index entries, not used as an
+archive of withdrawn charts. Once a nonempty eligible set is parsed, absent or
+ineligible application versions are removed from the in-memory candidate before
+merging and reducing patch boundaries. A replacement chart for the same
+application version keeps that application's existing summary.
+
+Pruning is committed only after every retained chart passes digest, metadata and
+Helm checks. An unavailable index, an advertised archive returning an HTTP error,
+an invalid entry, or an empty/wholly ineligible index leaves the saved catalog
+unchanged. HTTP failures are not evidence that an application was withdrawn.
+
 ## Fixtures and test boundaries
 
 `fixtures/k8gb/index.yaml` contains unchanged selected fields from four actual

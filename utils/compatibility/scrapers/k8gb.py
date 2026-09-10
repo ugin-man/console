@@ -134,6 +134,14 @@ def scrape():
             ("requirements", []), ("incompatibilities", []),
         ]))
     candidate = deepcopy(existing)
+    # This is a catalog of currently eligible charts, not an archive. Prune
+    # absent/ineligible applications before reduction so an old patch boundary
+    # cannot displace a still-published one. Keep summaries by application
+    # version even when the selected chart for that application changes.
+    current_versions = {row["version"] for row in rows}
+    candidate["versions"] = [
+        row for row in candidate["versions"] if row["version"] in current_versions
+    ]
     update_versions_data(candidate, rows)
     candidate["versions"] = reduce_versions(candidate["versions"])
     for row in candidate["versions"]:
